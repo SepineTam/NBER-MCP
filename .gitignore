@@ -32,3 +32,6 @@ downloads/
 
 # private
 private/
+
+# env
+.env
