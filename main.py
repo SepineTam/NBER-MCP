@@ -20,6 +20,12 @@ def search(q_list: list) -> list:
 
     Returns:
         The list of search results.
+
+    Notes:
+        The search keywords should be as precise as possible.
+        If you only use China and Chinese as search terms,
+        the search time is about an hour,
+        which is what I have tried, and what we don't want to face.
     """
     search_result: list = []
     for q in q_list:
