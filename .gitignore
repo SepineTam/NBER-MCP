@@ -27,4 +27,8 @@ test*
 # OS X
 *.DS_Store
 
+# downloads path
+downloads/
 
+# private
+private/
