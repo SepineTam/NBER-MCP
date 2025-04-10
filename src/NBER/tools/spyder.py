@@ -7,6 +7,15 @@
 # @Email  : sepinetam@gmail.com
 # @File   : spyder.py
 
+# !/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2025 - Present Sepine Tam, Inc. All Rights Reserved
+#
+# @Author : Sepine Tam
+# @Email  : sepinetam@gmail.com
+# @File   : spyder.py
+
 import requests
 import time
 import sqlite3
@@ -39,6 +48,7 @@ if not os.path.exists(DB_PATH):
     conn.commit()
     conn.close()
 
+
 def get_ok_ids() -> list:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -67,12 +77,11 @@ def get_ok_ids() -> list:
 
     return ok_ids
 
+
 def soon_list(n=max_paper, start=start, ok_list=None):
     if ok_list is None:
         ok_list = get_ok_ids()
     # 创建一个包含 "w0" 到 "w(n-1)" 的列表
-    if ok_list is None:
-        ok_list = []
     soon = [f"w{i}" for i in range(start, n)]
 
     # 将 ok_list 转换为集合，加速查找
@@ -83,11 +92,14 @@ def soon_list(n=max_paper, start=start, ok_list=None):
 
     return result
 
+
 def gen_doi(code):
     return f"10.3386/{code}"
 
+
 def pdf_url(code):
     return f"https://www.nber.org/system/files/working_papers/{code}/{code}.pdf"
+
 
 def down(paper_id, conn):
     download_link = pdf_url(paper_id)
@@ -112,7 +124,7 @@ def down(paper_id, conn):
 
         # 生成DOI
         doi = gen_doi(paper_id)
-        
+
         # 创建cursor
         cursor = conn.cursor()
 
@@ -131,42 +143,45 @@ def down(paper_id, conn):
                     f.write(chunk)
 
             # 插入完整信息到数据库，包括DOI
+            # 修正：使用SQLite的?占位符而不是%s
             query = """
-            INSERT INTO NBER (id, state, download_link, save_path, doi) 
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO NBER (id, state, url, save_path, doi) 
+            VALUES (?, ?, ?, ?, ?)
             """
             cursor.execute(query, (paper_id, status_code, download_link, save_path, doi))
         else:
             # 如果状态码不是200，只插入ID和状态码
+            # 修正：使用SQLite的?占位符而不是%s
             query = """
             INSERT INTO NBER (id, state) 
-            VALUES (%s, %s)
+            VALUES (?, ?)
             """
             cursor.execute(query, (paper_id, status_code))
-            
+
         # 提交事务
         conn.commit()
-        
+
         # 返回状态码
         return status_code
-    
+
     except requests.exceptions.RequestException as e:
         print(f"下载过程中出错: {e}")
         # 出错时，状态码设为0，并插入数据库
         cursor = conn.cursor()
+        # 修正：使用SQLite的?占位符而不是%s
         query = """
         INSERT INTO NBER (id, state) 
-        VALUES (%s, %s)
+        VALUES (?, ?)
         """
         cursor.execute(query, (paper_id, 0))  # 0作为整数
         conn.commit()
         return 0
-    
+
+
 def main():
-    soon: list = soon_list()
+    soon = soon_list()
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    wrong: list = []
+    wrong = []
     for soon_i in soon:
         time.sleep(3)
         print(f"Begin {soon_i}")
@@ -178,11 +193,9 @@ def main():
             else:
                 wrong.append(soon_i)
                 print(f"Wrong! response code = {resp_code}")
-        except:
+        except Exception as e:
             wrong.append(soon_i)
-            print(f"Something went wrong, code = {soon_i}")
-        finally:
-            conn.commit()
+            print(f"Something went wrong, code = {soon_i}, error: {e}")
     conn.close()
 
     print(wrong if wrong else None)
