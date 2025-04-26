@@ -5,202 +5,236 @@
 #
 # @Author : Sepine Tam
 # @Email  : sepinetam@gmail.com
-# @File   : spyder.py
+# @File   : async_spyder.py
 
-# !/usr/bin/python3
-# -*- coding: utf-8 -*-
-#
-# Copyright (C) 2025 - Present Sepine Tam, Inc. All Rights Reserved
-#
-# @Author : Sepine Tam
-# @Email  : sepinetam@gmail.com
-# @File   : spyder.py
-
-import requests
-import time
-import sqlite3
+import aiohttp
+import asyncio
+import aiosqlite
 import os
-
+import time
 from fake_useragent import UserAgent
+from typing import List, Set
+import logging
 
+# 设置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("async_spyder.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 假设从原始代码导入
 from src.config import SAVE_DIR
 
-max_paper = 100000
-start = 0
+# 配置参数
+MAX_PAPER = 10000
+START = 0
+MAX_CONCURRENT_REQUESTS = 20  # 控制并发请求数量
+DELAY_BETWEEN_REQUESTS = 0.5  # 每个请求之间的延迟（秒）
 
 DB_PATH = os.path.abspath(os.path.join(SAVE_DIR, "paper_state.db"))
-# print(DB_PATH)
-
-if not os.path.exists(DB_PATH):
-    print(f"数据库文件 {DB_PATH} 不存在，正在初始化...")
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS NBER (
-        id TEXT PRIMARY KEY,
-        url TEXT,
-        doi TEXT,
-        save_path TEXT,
-        state INTEGER DEFAULT 0
-    )
-    ''')
-    conn.commit()
-    conn.close()
 
 
-def get_ok_ids() -> list:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # 首先获取表的所有列名，以便我们知道哪些是"其他列"
-    cursor.execute("SELECT * FROM NBER LIMIT 0")
-    columns = [desc[0] for desc in cursor.description]
+async def initialize_db():
+    """初始化数据库"""
+    if not os.path.exists(DB_PATH):
+        logger.info(f"数据库文件 {DB_PATH} 不存在，正在初始化...")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+            CREATE TABLE IF NOT EXISTS NBER (
+                id TEXT PRIMARY KEY,
+                url TEXT,
+                doi TEXT,
+                save_path TEXT,
+                state INTEGER DEFAULT 0
+            )
+            ''')
+            await db.commit()
+        logger.info("数据库初始化完成")
 
-    # 排除ID和state列，因为我们有特定的条件
-    other_columns = [col for col in columns if col.lower() != 'id' and col.lower() != 'state']
 
-    # 构建查询语句：先筛选state=200的记录，然后确保其他所有列都不为NULL
-    query = f"""
-    SELECT id FROM NBER 
-    WHERE state = 200
-    AND {" AND ".join([f"{col} IS NOT NULL" for col in other_columns])}
-    """
+async def get_ok_ids() -> List[str]:
+    """获取已成功下载的ID列表"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 获取表的所有列名
+        cursor = await db.execute("SELECT * FROM NBER LIMIT 0")
+        columns = [desc[0] for desc in cursor.description]
 
-    # 执行查询
-    cursor.execute(query)
+        # 排除ID和state列
+        other_columns = [col for col in columns if col.lower() != 'id' and col.lower() != 'state']
 
-    # 获取结果并整理成列表
-    results = cursor.fetchall()
-    conn.close()
+        # 构建查询语句
+        query = f"""
+        SELECT id FROM NBER 
+        WHERE state = 200
+        AND {" AND ".join([f"{col} IS NOT NULL" for col in other_columns])}
+        """
+
+        # 执行查询
+        cursor = await db.execute(query)
+        results = await cursor.fetchall()
 
     ok_ids = [row[0] for row in results]
-
+    logger.info(f"已成功下载的论文数量: {len(ok_ids)}")
     return ok_ids
 
 
-def soon_list(n=max_paper, start=start, ok_list=None):
-    if ok_list is None:
-        ok_list = get_ok_ids()
+async def get_all_ids_in_db() -> Set[str]:
+    """获取数据库中所有ID"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM NBER")
+        results = await cursor.fetchall()
+
+    return {row[0] for row in results}
+
+
+def soon_list(n=MAX_PAPER, start=START, ok_ids=None, all_ids=None):
+    """创建待下载的论文ID列表"""
     # 创建一个包含 "w0" 到 "w(n-1)" 的列表
-    soon = [f"w{i}" for i in range(start, n)]
+    all_possible = [f"w{i}" for i in range(start, n)]
 
-    # 将 ok_list 转换为集合，加速查找
-    ok_set = set(ok_list)
-
-    # 使用集合操作移除在 ok_list 中的元素
-    result = [item for item in soon if item not in ok_set]
+    # 移除已在数据库中的ID
+    if all_ids:
+        result = [item for item in all_possible if item not in all_ids]
+    else:
+        # 移除已成功下载的ID
+        ok_set = set(ok_ids) if ok_ids else set()
+        result = [item for item in all_possible if item not in ok_set]
 
     return result
 
 
 def gen_doi(code):
+    """生成DOI"""
     return f"10.3386/{code}"
 
 
 def pdf_url(code):
+    """生成PDF URL"""
     return f"https://www.nber.org/system/files/working_papers/{code}/{code}.pdf"
 
 
-def down(paper_id, conn):
-    download_link = pdf_url(paper_id)
+async def download_paper(paper_id: str, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
+    """异步下载单个论文并更新数据库"""
+    async with semaphore:  # 限制并发请求数
+        # 添加小延迟防止请求过快
+        await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
 
-    ua = UserAgent()
-
-    # 随机选择一个用户代理
-    random_user_agent = ua.random
-
-    headers = {
-        'User-Agent': random_user_agent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'max-age=0',
-        'Referer': 'https://www.nber.org/papers/',
-    }
-    try:
-        resp = requests.get(download_link, headers=headers, stream=True)
-        status_code = int(resp.status_code)  # 确保状态码是整数类型
-
-        # 生成DOI
+        download_link = pdf_url(paper_id)
         doi = gen_doi(paper_id)
 
-        # 创建cursor
-        cursor = conn.cursor()
-
-        # 准备插入数据库的信息
-        if status_code == 200:
-            # 如果状态码是200，下载文件并插入完整信息
-            resp.raise_for_status()
-            os.makedirs(
-                (save_dir := os.path.join(SAVE_DIR, paper_id)),
-                exist_ok=True
-            )
-            save_path = os.path.join(save_dir, f"{paper_id}.pdf")
-
-            with open(save_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            # 插入完整信息到数据库，包括DOI
-            # 修正：使用SQLite的?占位符而不是%s
-            query = """
-            INSERT INTO NBER (id, state, url, save_path, doi) 
-            VALUES (?, ?, ?, ?, ?)
-            """
-            cursor.execute(query, (paper_id, status_code, download_link, save_path, doi))
-        else:
-            # 如果状态码不是200，只插入ID和状态码
-            # 修正：使用SQLite的?占位符而不是%s
-            query = """
-            INSERT INTO NBER (id, state) 
-            VALUES (?, ?)
-            """
-            cursor.execute(query, (paper_id, status_code))
-
-        # 提交事务
-        conn.commit()
-
-        # 返回状态码
-        return status_code
-
-    except requests.exceptions.RequestException as e:
-        print(f"下载过程中出错: {e}")
-        # 出错时，状态码设为0，并插入数据库
-        cursor = conn.cursor()
-        # 修正：使用SQLite的?占位符而不是%s
-        query = """
-        INSERT INTO NBER (id, state) 
-        VALUES (?, ?)
-        """
-        cursor.execute(query, (paper_id, 0))  # 0作为整数
-        conn.commit()
-        return 0
-
-
-def main():
-    soon = soon_list()
-    conn = sqlite3.connect(DB_PATH)
-    wrong = []
-    for soon_i in soon:
-        time.sleep(3)
-        print(f"Begin {soon_i}")
+        ua = UserAgent()
+        headers = {
+            'User-Agent': ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0',
+            'Referer': 'https://www.nber.org/papers/',
+        }
 
         try:
-            resp_code = down(paper_id=soon_i, conn=conn)
-            if resp_code == 200:
-                print(f"Successful, code = {soon_i}")
-            else:
-                wrong.append(soon_i)
-                print(f"Wrong! response code = {resp_code}")
-        except Exception as e:
-            wrong.append(soon_i)
-            print(f"Something went wrong, code = {soon_i}, error: {e}")
-    conn.close()
+            start_time = time.time()
+            async with session.get(download_link, headers=headers) as resp:
+                status_code = resp.status
 
-    print(wrong if wrong else None)
-    return wrong
+                async with aiosqlite.connect(DB_PATH) as db:
+                    if status_code == 200:
+                        # 确保目录存在
+                        save_dir = os.path.join(SAVE_DIR, paper_id)
+                        os.makedirs(save_dir, exist_ok=True)
+                        save_path = os.path.join(save_dir, f"{paper_id}.pdf")
+
+                        # 下载PDF
+                        content = await resp.read()
+                        with open(save_path, 'wb') as f:
+                            f.write(content)
+
+                        # 更新数据库
+                        await db.execute(
+                            "INSERT INTO NBER (id, state, url, save_path, doi) VALUES (?, ?, ?, ?, ?)",
+                            (paper_id, status_code, download_link, save_path, doi)
+                        )
+                        await db.commit()
+
+                        logger.info(f"成功下载 {paper_id}, 耗时: {time.time() - start_time:.2f}秒")
+                        return True
+                    else:
+                        # 状态码不是200，仅记录ID和状态
+                        await db.execute(
+                            "INSERT INTO NBER (id, state) VALUES (?, ?)",
+                            (paper_id, status_code)
+                        )
+                        await db.commit()
+
+                        logger.warning(f"下载失败 {paper_id}, 状态码: {status_code}")
+                        return False
+
+        except Exception as e:
+            logger.error(f"下载 {paper_id} 时出错: {str(e)}")
+            # 记录错误状态
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO NBER (id, state) VALUES (?, ?)",
+                    (paper_id, 0)
+                )
+                await db.commit()
+            return False
+
+
+async def main():
+    """主异步函数"""
+    start_time = time.time()
+
+    # 初始化数据库
+    await initialize_db()
+
+    # 获取已成功下载的ID
+    ok_ids = await get_ok_ids()
+
+    # 获取数据库中的所有ID
+    all_ids = await get_all_ids_in_db()
+
+    # 获取待下载列表
+    download_list = soon_list(all_ids=all_ids)
+    total_papers = len(download_list)
+
+    if not download_list:
+        logger.info("没有新的论文需要下载")
+        return
+
+    logger.info(f"开始下载 {total_papers} 篇论文")
+
+    # 创建信号量控制并发
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    # 创建异步下载任务
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for paper_id in download_list:
+            task = asyncio.create_task(download_paper(paper_id, session, semaphore))
+            tasks.append(task)
+
+        # 等待所有任务完成并收集结果
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 统计结果
+        success_count = sum(1 for r in results if r is True)
+        failed_count = total_papers - success_count
+
+    logger.info(f"下载完成! 总耗时: {time.time() - start_time:.2f}秒")
+    logger.info(f"成功: {success_count}, 失败: {failed_count}")
 
 
 if __name__ == "__main__":
-    main()
+    # 在Windows上需要设置事件循环策略
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # 运行异步主函数
+    asyncio.run(main())
